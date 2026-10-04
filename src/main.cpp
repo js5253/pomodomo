@@ -95,7 +95,6 @@ void ARDUINO_ISR_ATTR makeIdle()
 
 void tfDisplay(void *params)
 {
-  display.clearDisplay();
   display.setTextSize(1);
   display.setTextColor(WHITE);
   display.setCursor(0, 10);
@@ -110,7 +109,6 @@ void tfDisplay(void *params)
     switch (state)
     {
     case INIT:
-      ESP_ERROR_CHECK(display.begin());
       break;
     case WORKING:
       xSemaphoreTake(mElapsedTime, portMAX_DELAY);
@@ -147,7 +145,6 @@ void tfDisplay(void *params)
 void tfIMU(void *params)
 {
   // setup
-  ESP_ERROR_CHECK(mpu.begin());
 
   sensors_event_t *accel;
   sensors_event_t *gyro;
@@ -165,7 +162,6 @@ void tfIMU(void *params)
     switch (state)
     {
     case INIT:
-      // do something
     [[fallthrough]]
     case WORKING:
     [[fallthrough]]
@@ -228,7 +224,7 @@ void tfTimer(void *params)
       xSemaphoreTake(mLeftTime, 0);
       state = AppState::WORKING;
       printf("Time Change!");
-      myTimer = timerBegin(TIMER_0, 2, false); /// FIXME: check if this is an appropriate prescaler value
+      myTimer = timerBegin(TIMER_0, 2, false); /// TODO: check if this is an appropriate prescaler value
       timerAttachInterrupt(myTimer, &onTimer, false);
       timerAlarmWrite(myTimer, 1000000, true);
       timerStart(myTimer);
@@ -281,12 +277,6 @@ void onRequest(AsyncWebServerRequest *request)
 
 void tfNetwork(void *params)
 {
-  LittleFS.begin(true);
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(SSID, PASSWORD);
-  server.onNotFound(onRequest);
-  server.serveStatic("/page.htm", LittleFS, "/www/index.html").setDefaultFile("/www/index.html");
-  server.begin();
   /// TODO: check that AsyncWebServer works well this way/under FreeRTOS
   while (true)
   {
@@ -296,8 +286,22 @@ void tfNetwork(void *params)
 
 void setup()
 {
+  // do peripheral setup
   Serial.begin(112500);
-  setCpuFrequencyMhz(80); /// TODO: implement better power-saving methods.
+  ESP_ERROR_CHECK(mpu.begin());
+  ESP_ERROR_CHECK(LittleFS.begin(true));
+  WiFi.mode(WIFI_STA);
+  ESP_ERROR_CHECK(WiFi.begin(SSID, PASSWORD));
+  ESP_ERROR_CHECK(display.begin());
+  display.clearDisplay();
+  server.onNotFound(onRequest);
+  server.serveStatic("/page.htm", LittleFS, "/www/index.html").setDefaultFile("/www/index.html");
+  server.begin();
+
+  // end peripheral setup
+
+  setCpuFrequencyMhz(80);
+
   // get default minute mappings
   preferences.begin("config", false);
   minutes = OrientationMinuteMappings{
@@ -308,7 +312,7 @@ void setup()
   };
   preferences.end();
   // end default minute mappings
-  qOrientationChange = xQueueCreate(1000, sizeof(GyroMessageType));
+  qOrientationChange = xQueueCreate(500, sizeof(GyroMessageType));
 
   xTaskCreate(tfDisplay, "DisplayTask", 1000, NULL, 3, &tDisplay);
   xTaskCreate(tfIMU, "IMUTask", 1000, NULL, 2, &tIMU);
