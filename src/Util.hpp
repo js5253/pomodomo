@@ -10,8 +10,3 @@ enum AppState
 // #include <concepts>
 AppState getSystemState(void);
 void setSystemState(AppState state);
-// enable this when we make this use C++ more
-// template <typename T>
-// concept IsFreeRTOSTask = requires (T x) {
-    // here is where we add things
-// };

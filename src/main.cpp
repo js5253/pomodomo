@@ -15,7 +15,7 @@
 #include <ESPAsyncWebServer.h>
 #include <LittleFS.h>
 #include <driver/i2s.h>
-#include "Util.h"
+#include "Util.hpp"
 #include <Audio.h>
 
 #define SCREEN_WIDTH 128
@@ -39,21 +39,19 @@ volatile int timeLeft = 0;
 
 QueueHandle_t qOrientationChange;
 
-Adafruit_MPU6050 mpu;
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
-
 SemaphoreHandle_t mElapsedTime = xSemaphoreCreateMutex();
 SemaphoreHandle_t mLeftTime = xSemaphoreCreateMutex();
+SemaphoreHandle_t mMinutes = xSemaphoreCreateMutex();
 
-hw_timer_t *myTimer = NULL;
-
-AsyncWebServer server(80);
-
-TaskHandle_t tDisplay;
+TaskHandle_t tInteraction;
 TaskHandle_t tIMU;
 TaskHandle_t tNetwork;
 TaskHandle_t tTimer;
 
+Adafruit_MPU6050 mpu;
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+hw_timer_t *myTimer = NULL;
+AsyncWebServer server(80);
 Preferences preferences;
 Audio audio;
 
@@ -93,7 +91,7 @@ void ARDUINO_ISR_ATTR makeIdle()
   setSystemState(AppState::IDLE);
 }
 
-void tfDisplay(void *params)
+void tfInteraction(void *params)
 {
   display.setTextSize(1);
   display.setTextColor(WHITE);
@@ -221,7 +219,6 @@ void tfTimer(void *params)
         timeLeft = minutes.clock_90;
         break;
       }
-      xSemaphoreTake(mLeftTime, 0);
       state = AppState::WORKING;
       printf("Time Change!");
       myTimer = timerBegin(TIMER_0, 2, false); /// TODO: check if this is an appropriate prescaler value
@@ -231,6 +228,8 @@ void tfTimer(void *params)
 
       xSemaphoreTake(mElapsedTime, portMAX_DELAY);
       timeElapsed = 0;
+      xSemaphoreGive(mElapsedTime);
+      xSemaphoreGive(mLeftTime);
       delete messageEvent;
     };
     switch (state)
@@ -269,10 +268,30 @@ void tfTimer(void *params)
   }
 }
 
-void onRequest(AsyncWebServerRequest *request)
+void onRequest(AsyncWebServerRequest *req)
 {
   // Handle Unknown Request
-  request->send(404);
+  req->send(404);
+}
+void onConfigChangeRequest(AsyncWebServerRequest *req)
+{
+  if (req->hasParam("counterTime") && req->hasParam("normalTime") && req->hasParam("clockTime") && req->hasParam("'invertTime"))
+  {
+    const int counterTime = req->getParam("counterTime")->value().toInt();
+    const int normalTime = req->getParam("normalTime")->value().toInt();
+    const int clockTime = req->getParam("clockTime")->value().toInt();
+    const int invertTime = req->getParam("invertTime")->value().toInt();
+
+    xSemaphoreTake(mMinutes, portMAX_DELAY);
+    minutes = {
+        .normal = normalTime || minutes.normal,
+        .count_90 = counterTime || minutes.count_90,
+        .inverted = invertTime || minutes.inverted,
+        .clock_90 = clockTime || minutes.clock_90,
+    };
+    xSemaphoreGive(mMinutes);
+  }
+  req->send(200);
 }
 
 void tfNetwork(void *params)
@@ -287,15 +306,17 @@ void tfNetwork(void *params)
 void setup()
 {
   // do peripheral setup
-  Serial.begin(112500);
+  Serial.begin(115200);
   ESP_ERROR_CHECK(mpu.begin());
   ESP_ERROR_CHECK(LittleFS.begin(true));
   WiFi.mode(WIFI_STA);
   ESP_ERROR_CHECK(WiFi.begin(SSID, PASSWORD));
   ESP_ERROR_CHECK(display.begin());
   display.clearDisplay();
+
   server.onNotFound(onRequest);
-  server.serveStatic("/page.htm", LittleFS, "/www/index.html").setDefaultFile("/www/index.html");
+  server.on("/config", onConfigChangeRequest);
+  server.serveStatic("/index.html", LittleFS, "/www/index.html").setDefaultFile("/www/index.html");
   server.begin();
 
   // end peripheral setup
@@ -314,7 +335,7 @@ void setup()
   // end default minute mappings
   qOrientationChange = xQueueCreate(500, sizeof(GyroMessageType));
 
-  xTaskCreate(tfDisplay, "DisplayTask", 1000, NULL, 3, &tDisplay);
+  xTaskCreate(tfInteraction, "InteractionTask", 1000, NULL, 3, &tInteraction);
   xTaskCreate(tfIMU, "IMUTask", 1000, NULL, 2, &tIMU);
   xTaskCreate(tfNetwork, "NetworkTask", 1000, NULL, 4, &tNetwork);
   xTaskCreate(tfTimer, "TimerTask", 1000, NULL, 1, &tTimer);
