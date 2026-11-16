@@ -24,6 +24,15 @@
 #define I2S_DOUT 22
 #define I2S_BCLK 26
 #define I2S_LRC 25
+
+uint8_t gyroQueueStorageArea[10 * sizeof(GyroMessage)];
+StaticQueue_t gyroStaticQueue;
+
+uint8_t elapsedStorageArea[sizeof(bool)];
+uint8_t leftTimeStorageArea[sizeof(bool)];
+uint8_t minutesStorageArea[sizeof(bool)];
+
+
 // CONFIGURE THESE VALUES!
 
 struct OrientationMinuteMappings
@@ -39,9 +48,15 @@ volatile int timeLeft = 0;
 
 QueueHandle_t qOrientationChange;
 
-SemaphoreHandle_t mElapsedTime = xSemaphoreCreateMutex();
-SemaphoreHandle_t mLeftTime = xSemaphoreCreateMutex();
-SemaphoreHandle_t mMinutes = xSemaphoreCreateMutex();
+StaticQueue_t timeStaticQueue;
+
+StaticSemaphore_t* elapsedTimeSemaphore;
+StaticSemaphore_t* leftTimeSemaphore;
+StaticSemaphore_t* minutesSemaphore;
+
+SemaphoreHandle_t mElapsedTime = xSemaphoreCreateMutexStatic(elapsedTimeSemaphore);
+SemaphoreHandle_t mLeftTime = xSemaphoreCreateMutexStatic(leftTimeSemaphore);
+SemaphoreHandle_t mMinutes = xSemaphoreCreateMutexStatic(minutesSemaphore);
 
 TaskHandle_t tInteraction;
 TaskHandle_t tIMU;
@@ -100,7 +115,7 @@ void tfInteraction(void *params)
   audio.setPinout(I2S_BCLK, I2S_LRC, I2S_DOUT);
   audio.setVolume(17);
   audio.connecttoFS(LittleFS, "/alarm.wav");
-  int prevDisplayTime;
+  std::optional<int> prevDisplayTime = std::nullopt;
   while (true)
   {
     AppState state = getSystemState();
@@ -133,6 +148,9 @@ void tfInteraction(void *params)
       display.clearDisplay();
       display.printf("TIME!");
       break;
+    case ERROR:
+      display.clearDisplay();
+      display.printf("ERROR");
     case IDLE:
       // do something?
       break;
@@ -143,12 +161,9 @@ void tfInteraction(void *params)
 void tfIMU(void *params)
 {
   // setup
+  sensors_event_t gyro{};
 
-  sensors_event_t *accel;
-  sensors_event_t *gyro;
-  sensors_event_t *temp;
-
-  sensors_event_t *prevGyro;
+  std::optional<sensors_event_t> prevGyro = std::nullopt;
 
   mpu.setGyroRange(MPU6050_RANGE_1000_DEG);
   mpu.setAccelerometerStandby(true, true, true);
@@ -166,11 +181,13 @@ void tfIMU(void *params)
     case IDLE:
     [[fallthrough]]
     case BREAKING:
-      mpu.getEvent(accel, gyro, temp);
-      if (prevGyro != gyro)
+      mpu.getGyroSensor()->getEvent(&gyro);
+      if (!prevGyro || !isSameGyro(*prevGyro, gyro))
+        ;
       {
-        int degree = gyro->gyro.roll;
-        /// FIXME: add correct gyro and degree ratings
+
+        int degree = gyro.gyro.roll;
+        /// FIXME: add correct axis and degree rating
         GyroMessageType msg = GyroMessageType::CYCLE_FLIPPED_NORMAL;
         if (degree < 90)
         {
@@ -221,9 +238,9 @@ void tfTimer(void *params)
       }
       state = AppState::WORKING;
       printf("Time Change!");
-      myTimer = timerBegin(TIMER_0, 2, false); /// TODO: check if this is an appropriate prescaler value
-      timerAttachInterrupt(myTimer, &onTimer, false);
-      timerAlarmWrite(myTimer, 1000000, true);
+      myTimer = timerBegin(TIMER_0); /// TODO: check if this is an appropriate prescaler value
+      timerAttachInterrupt(myTimer, &onTimer);
+      timerWrite(myTimer, 1000000);
       timerStart(myTimer);
 
       xSemaphoreTake(mElapsedTime, portMAX_DELAY);
@@ -255,8 +272,8 @@ void tfTimer(void *params)
       break;
 
     case FINISHED:
-      timerAttachInterrupt(myTimer, &makeIdle, false);
-      timerAlarmWrite(myTimer, 1000000, true);
+      timerAttachInterrupt(myTimer, &makeIdle);
+      timerWrite(myTimer, 1000000);
       timerStart(myTimer);
 
       // here, make an alarm later on
@@ -275,19 +292,19 @@ void onRequest(AsyncWebServerRequest *req)
 }
 void onConfigChangeRequest(AsyncWebServerRequest *req)
 {
-  if (req->hasParam("counterTime") && req->hasParam("normalTime") && req->hasParam("clockTime") && req->hasParam("'invertTime"))
+  const AsyncWebParameter* counterTime = req->getParam("counterTime");
+  const AsyncWebParameter* normalTime = req->getParam("normalTime");
+  const AsyncWebParameter* clockTime = req->getParam("clockTime");
+  const AsyncWebParameter* invertTime = req->getParam("invertTime");
+  if (counterTime != nullptr && normalTime != nullptr && clockTime != nullptr && invertTime != nullptr)
   {
-    const int counterTime = req->getParam("counterTime")->value().toInt();
-    const int normalTime = req->getParam("normalTime")->value().toInt();
-    const int clockTime = req->getParam("clockTime")->value().toInt();
-    const int invertTime = req->getParam("invertTime")->value().toInt();
 
     xSemaphoreTake(mMinutes, portMAX_DELAY);
     minutes = {
-        .normal = normalTime || minutes.normal,
-        .count_90 = counterTime || minutes.count_90,
-        .inverted = invertTime || minutes.inverted,
-        .clock_90 = clockTime || minutes.clock_90,
+        .normal = normalTime->value().toInt() || minutes.normal,
+        .count_90 = counterTime->value().toInt() || minutes.count_90,
+        .inverted = invertTime->value().toInt() || minutes.inverted,
+        .clock_90 = clockTime->value().toInt() || minutes.clock_90,
     };
     xSemaphoreGive(mMinutes);
   }
@@ -307,12 +324,17 @@ void setup()
 {
   // do peripheral setup
   Serial.begin(115200);
-  ESP_ERROR_CHECK(mpu.begin());
+  switchOnError(display.begin());
+  switchOnError(mpu.begin());
+  switchOnError(LittleFS.begin());
   ESP_ERROR_CHECK(LittleFS.begin(true));
   WiFi.mode(WIFI_STA);
-  ESP_ERROR_CHECK(WiFi.begin(SSID, PASSWORD));
-  ESP_ERROR_CHECK(display.begin());
+  switchOnError(WL_CONNECT_FAILED != WiFi.begin(SSID, PASSWORD));
   display.clearDisplay();
+
+  switchOnError(elapsedTimeSemaphore);
+  switchOnError(leftTimeSemaphore);
+  switchOnError(minutesSemaphore);
 
   server.onNotFound(onRequest);
   server.on("/config", onConfigChangeRequest);
@@ -324,7 +346,7 @@ void setup()
   setCpuFrequencyMhz(80);
 
   // get default minute mappings
-  preferences.begin("config", false);
+  switchOnError(preferences.begin("config", false));
   minutes = OrientationMinuteMappings{
       .normal = preferences.getInt("normal", 5),
       .count_90 = preferences.getInt("count_90", 10),
@@ -333,7 +355,7 @@ void setup()
   };
   preferences.end();
   // end default minute mappings
-  qOrientationChange = xQueueCreate(500, sizeof(GyroMessageType));
+  qOrientationChange = xQueueCreateStatic(500, sizeof(GyroMessageType), gyroQueueStorageArea, &gyroStaticQueue);
 
   xTaskCreate(tfInteraction, "InteractionTask", 1000, NULL, 3, &tInteraction);
   xTaskCreate(tfIMU, "IMUTask", 1000, NULL, 2, &tIMU);
